@@ -53,7 +53,7 @@ def create_app():
                 gr.HTML("""
                 <div style="text-align:right; padding:10px;">
                     <span style="background:linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                                 color:white; padding:5px 15px; border-radius:20px; font-weight:bold;">
+                                 color:white; padding:5px 15px; border-radius:20px; font-weight:bold; white-space: nowrap;">
                         🌐 中文 | EN
                     </span>
                 </div>
