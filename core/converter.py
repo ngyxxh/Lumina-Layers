@@ -326,6 +326,8 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
     for mat_id in range(num_materials):
         mesh = mesher.generate_mesh(full_matrix, mat_id, target_h)
         if mesh:
+            # [ROLLBACK] Removed smart simplification as per user request
+            # Warning: Large models may produce huge 3MF files
             mesh.apply_transform(transform)
             mesh.visual.face_colors = preview_colors[mat_id]
             name = slot_names[mat_id]
@@ -367,9 +369,6 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
         except Exception as e:
             print(f"[CONVERTER] Loop creation failed: {e}")
     
-<<<<<<< HEAD
-    # Step 8: Export 3MF
-=======
     # ========== Step 8: Export 3MF ==========
     # 单面模式需要 X 轴镜像修正，使 3MF 输出与预览/GLB 一致
     is_single_sided = "单面" in structure_mode or "Single" in structure_mode
@@ -384,7 +383,6 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
         for geom_name in list(scene.geometry.keys()):
             scene.geometry[geom_name].apply_transform(mirror_transform)
     
->>>>>>> pr-54
     base_name = os.path.splitext(os.path.basename(image_path))[0]
     out_path = os.path.join(OUTPUT_DIR, f"{base_name}_Lumina.3mf")
     scene.export(out_path)
@@ -681,16 +679,10 @@ def generate_preview_cached(image_path, lut_path, target_width_mm,
                             auto_bg, bg_tol, color_mode,
                             modeling_mode: ModelingMode = ModelingMode.HIGH_FIDELITY):
     """
-<<<<<<< HEAD
-    Generate preview and cache data for 2D preview interface.
-    
-    Uses same smart defaults for consistency.
-=======
     Generate preview and cache data
     For 2D preview interface
 
     Uses same smart defaults for consistency
->>>>>>> pr-55
     """
     if image_path is None:
         return None, None, "❌ Please upload an image"
@@ -711,11 +703,7 @@ def generate_preview_cached(image_path, lut_path, target_width_mm,
         result = processor.process_image(
             image_path=image_path,
             target_width_mm=target_width_mm,
-<<<<<<< HEAD
-            modeling_mode="pixel",
-=======
             modeling_mode=modeling_mode,  # Use user-selected modeling mode
->>>>>>> pr-55
             quantize_colors=16,
             auto_bg=auto_bg,
             bg_tol=bg_tol,

@@ -361,6 +361,10 @@ class LuminaImageProcessor:
         High-fidelity mode image processing
         Includes configurable filtering, K-Means quantization and color matching
         
+        优化：
+        1. K-Means++ 初始化（OpenCV 默认支持）
+        2. 预缩放：在小图上做 K-Means，然后映射回原图
+        
         Args:
             rgb_arr: Input RGB array
             target_h: Target height
@@ -379,7 +383,7 @@ class LuminaImageProcessor:
             print(f"[IMAGE_PROCESSOR] Applying bilateral filter (sigma={smooth_sigma})...")
             rgb_processed = cv2.bilateralFilter(
                 rgb_arr.astype(np.uint8), 
-                d=9,  # Larger neighborhood for better smoothing
+                d=9,
                 sigmaColor=smooth_sigma, 
                 sigmaSpace=smooth_sigma
             )
@@ -389,7 +393,6 @@ class LuminaImageProcessor:
         
         # Step 2: Optional median filter (remove salt-and-pepper noise)
         if blur_kernel > 0:
-            # Ensure kernel size is odd
             kernel_size = blur_kernel if blur_kernel % 2 == 1 else blur_kernel + 1
             print(f"[IMAGE_PROCESSOR] Applying median blur (kernel={kernel_size})...")
             rgb_processed = cv2.medianBlur(rgb_processed, kernel_size)
@@ -401,20 +404,65 @@ class LuminaImageProcessor:
         print(f"[IMAGE_PROCESSOR] Skipping sharpening to reduce noise...")
         rgb_sharpened = rgb_processed
         
-        # Step 4: K-Means quantization
-        print(f"[IMAGE_PROCESSOR] K-Means quantization to {quantize_colors} colors...")
+        # Step 4: K-Means quantization with pre-scaling optimization
         h, w = rgb_sharpened.shape[:2]
-        pixels = rgb_sharpened.reshape(-1, 3).astype(np.float32)
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
-        flags = cv2.KMEANS_PP_CENTERS
+        total_pixels = h * w
         
-        _, labels, centers = cv2.kmeans(
-            pixels, quantize_colors, None, criteria, 10, flags
-        )
+        # 方案 3：预缩放优化
+        # 如果像素数超过 50 万，先缩小做 K-Means，再映射回原图
+        KMEANS_PIXEL_THRESHOLD = 500_000
         
-        centers = centers.astype(np.uint8)
-        quantized_pixels = centers[labels.flatten()]
-        quantized_image = quantized_pixels.reshape(h, w, 3)
+        if total_pixels > KMEANS_PIXEL_THRESHOLD:
+            # 计算缩放比例，目标 50 万像素
+            scale_factor = np.sqrt(total_pixels / KMEANS_PIXEL_THRESHOLD)
+            small_h = int(h / scale_factor)
+            small_w = int(w / scale_factor)
+            
+            print(f"[IMAGE_PROCESSOR] 🚀 Pre-scaling optimization: {w}×{h} → {small_w}×{small_h} ({total_pixels:,} → {small_w*small_h:,} pixels)")
+            
+            # 缩小图片
+            rgb_small = cv2.resize(rgb_sharpened, (small_w, small_h), interpolation=cv2.INTER_AREA)
+            
+            # 在小图上做 K-Means（使用 K-Means++ 初始化）
+            pixels_small = rgb_small.reshape(-1, 3).astype(np.float32)
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.5)
+            flags = cv2.KMEANS_PP_CENTERS  # K-Means++ 初始化
+            
+            print(f"[IMAGE_PROCESSOR] K-Means++ on downscaled image ({quantize_colors} colors)...")
+            _, _, centers = cv2.kmeans(
+                pixels_small, quantize_colors, None, criteria, 5, flags
+            )
+            
+            # 用得到的 centers 直接映射原图（不再迭代，只做最近邻查找）
+            print(f"[IMAGE_PROCESSOR] Mapping centers to full image...")
+            centers = centers.astype(np.float32)
+            pixels_full = rgb_sharpened.reshape(-1, 3).astype(np.float32)
+            
+            # 批量计算每个像素到所有 centers 的距离，找最近的
+            # 使用 KDTree 加速
+            from scipy.spatial import KDTree
+            centers_tree = KDTree(centers)
+            _, labels = centers_tree.query(pixels_full)
+            
+            centers = centers.astype(np.uint8)
+            quantized_pixels = centers[labels]
+            quantized_image = quantized_pixels.reshape(h, w, 3)
+            
+            print(f"[IMAGE_PROCESSOR] ✅ Pre-scaling optimization complete!")
+        else:
+            # 小图直接做 K-Means
+            print(f"[IMAGE_PROCESSOR] K-Means++ quantization to {quantize_colors} colors...")
+            pixels = rgb_sharpened.reshape(-1, 3).astype(np.float32)
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+            flags = cv2.KMEANS_PP_CENTERS
+            
+            _, labels, centers = cv2.kmeans(
+                pixels, quantize_colors, None, criteria, 10, flags
+            )
+            
+            centers = centers.astype(np.uint8)
+            quantized_pixels = centers[labels.flatten()]
+            quantized_image = quantized_pixels.reshape(h, w, 3)
         
         # [CRITICAL FIX] Post-Quantization Cleanup
         # Removes isolated "salt-and-pepper" noise pixels that survive quantization
@@ -439,25 +487,32 @@ class LuminaImageProcessor:
             color_to_stack[color_key] = self.ref_stacks[unique_indices[i]]
             color_to_rgb[color_key] = self.lut_rgb[unique_indices[i]]
         
-        # Map back to full image
+        # Map back to full image (vectorized for speed)
         print(f"[IMAGE_PROCESSOR] Mapping to full image...")
         matched_rgb = np.zeros((target_h, target_w, 3), dtype=np.uint8)
         material_matrix = np.zeros((target_h, target_w, PrinterConfig.COLOR_LAYERS), dtype=int)
         
-        for y in range(target_h):
-            for x in range(target_w):
-                color_key = tuple(quantized_image[y, x])
-                matched_rgb[y, x] = color_to_rgb[color_key]
-                material_matrix[y, x] = color_to_stack[color_key]
+        # 向量化映射，避免双重循环
+        flat_quantized = quantized_image.reshape(-1, 3)
+        flat_matched = np.zeros((target_h * target_w, 3), dtype=np.uint8)
+        flat_material = np.zeros((target_h * target_w, PrinterConfig.COLOR_LAYERS), dtype=int)
+        
+        for color_key, stack in color_to_stack.items():
+            mask = np.all(flat_quantized == np.array(color_key), axis=1)
+            flat_matched[mask] = color_to_rgb[color_key]
+            flat_material[mask] = stack
+        
+        matched_rgb = flat_matched.reshape(target_h, target_w, 3)
+        material_matrix = flat_material.reshape(target_h, target_w, PrinterConfig.COLOR_LAYERS)
         
         print(f"[IMAGE_PROCESSOR] Color matching complete!")
         
         # Prepare debug data
         debug_data = {
-            'quantized_image': quantized_image.copy(),  # K-Means quantized image
+            'quantized_image': quantized_image.copy(),
             'num_colors': len(unique_colors),
-            'bilateral_filtered': rgb_processed.copy(),  # Filtered image
-            'sharpened': rgb_sharpened.copy(),  # Sharpened image
+            'bilateral_filtered': rgb_processed.copy(),
+            'sharpened': rgb_sharpened.copy(),
             'filter_settings': {
                 'blur_kernel': blur_kernel,
                 'smooth_sigma': smooth_sigma
